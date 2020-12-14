@@ -178,7 +178,7 @@ var upgrader = ws.Upgrader{
 
 const PROTO_H2 = "/h2/1.0"
 
-func (t *H2Transport) maDial(ctx context.Context, raddr ma.Multiaddr, p peer.ID) (transport.CapableConn, error) {
+func (t *H2Transport) wsDial(ctx context.Context, raddr ma.Multiaddr, p peer.ID) (transport.CapableConn, error) {
 	_, host, err := manet.DialArgs(raddr)
 	if err != nil {
 		return nil, err

@@ -6,21 +6,88 @@ import (
 	"crypto/x509"
 	"encoding/asn1"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 
 	"github.com/docker/spdystream"
 	"github.com/libp2p/go-libp2p-core/connmgr"
 	ic "github.com/libp2p/go-libp2p-core/crypto"
+	n "github.com/libp2p/go-libp2p-core/network"
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/libp2p/go-libp2p-core/pnet"
 	"github.com/libp2p/go-libp2p-core/transport"
 	ma "github.com/multiformats/go-multiaddr"
+	mafmt "github.com/multiformats/go-multiaddr-fmt"
 	manet "github.com/multiformats/go-multiaddr/net"
+	"github.com/soheilhy/cmux"
+	"golang.org/x/net/http2"
 )
 
 
 var _ transport.Transport = (*H2Transport)(nil)
+
+var ports = map[string]*PortListeners{}
+
+type PortListeners struct {
+	l    net.Listener
+	m    cmux.CMux
+	grpc net.Listener
+	http net.Listener
+	h2   net.Listener
+	tls  net.Listener
+	ws   net.Listener
+}
+
+// WsFmt is multiaddr formatter for WsProtocol
+var WsFmt = mafmt.And(mafmt.TCP, mafmt.Base(ma.P_HTTPS))
+
+func init() {
+	// Multi-address protocol for H2.
+	ma.AddProtocol(ma.Protocol{
+		Name:  "h2",
+		Code:  ma.P_HTTPS,
+		VCode: ma.CodeToVarint(ma.P_HTTPS),
+	})
+}
+
+// Start the cmuxListen on the port.
+// Will create multiple listeners depending on detection.
+func (p *PortListeners) cmuxListen(port string) error {
+	l, err := net.Listen("tcp", port)
+	if err != nil {
+		return err
+	}
+	p.l = l
+
+	p.m = cmux.New(l)
+
+	p.grpc = p.m.Match(cmux.HTTP2HeaderField("content-type", "application/grpc"))
+	p.ws = p.m.Match(cmux.PrefixMatcher("CONNECT"))
+	p.http = p.m.Match(cmux.HTTP1Fast())
+	p.h2 = p.m.Match(cmux.HTTP2())
+
+	p.tls = p.m.Match(cmux.TLS())
+
+	go p.m.Serve()
+
+	return nil
+}
+
+func portMux(port string) (*PortListeners, error) {
+	p := ports[port]
+	if p != nil {
+		return p, nil
+	}
+
+	p = &PortListeners{}
+	err := p.cmuxListen(port)
+	if err != nil {
+		return nil, err
+	}
+	ports[port] = p
+	return p, nil
+}
 
 // H2Transport implements libp2p Transport.
 // It also implements http.Handler, and can be registered with a HTTP/2 or HTTP/1 server.
@@ -69,14 +136,24 @@ func NewH2Transport(key ic.PrivKey, psk pnet.PSK, gater connmgr.ConnectionGater)
 	}, nil
 }
 
+// This is _not_ WsFmt because we want the transport to stick to dialing fully
+// resolved addresses.
+var dialMatcherHttps = mafmt.And(mafmt.IP, mafmt.Base(ma.P_TCP),
+	mafmt.Base(ma.P_HTTPS))
+var dialMatcherWS = mafmt.And(mafmt.IP, mafmt.Base(ma.P_TCP),
+	mafmt.Base(ma.P_WS))
+
 func (t *H2Transport) CanDial(a ma.Multiaddr) bool {
-	return dialMatcher.Matches(a)
+	return dialMatcherHttps.Matches(a) || dialMatcherWS.Matches(a)
 }
 
+// Returns the list of protocol codes handled by this transport, using the int code
+// from the registry.
 func (t *H2Transport) Protocols() []int {
-	return []int{ma.P_WS}
+	return []int{ma.P_WS, ma.P_HTTPS}
 }
 
+// True for relay - currently not implemented.
 func (t *H2Transport) Proxy() bool {
 	return false
 }
@@ -85,10 +162,23 @@ func (t *H2Transport) Proxy() bool {
 // using an address. The ID is derived from the proto-representation of the key - either
 // SHA256 or the actual key if len <= 42
 func (t *H2Transport) Dial(ctx context.Context, raddr ma.Multiaddr, p peer.ID) (transport.CapableConn, error) {
+	ps := raddr.Protocols()
+	if len(ps) < 3 {
+		return nil, errors.New("Unexpected len of protocols")
+	}
 
 
 	// Implemented in one of the WS libraries. Need to find the most efficient.
-	return t.maDial(ctx, raddr, p)
+	cc, err := t.wsDial(ctx, raddr, p)
+	if err != nil {
+		return nil, err
+	}
+	if t.Gater != nil && !t.Gater.InterceptSecured(n.DirOutbound, p, cc) {
+		cc.Close()
+		return nil, fmt.Errorf("secured connection gated")
+	}
+
+	return cc, err
 }
 
 func (t *H2Transport) Listen(a ma.Multiaddr) (transport.Listener, error) {
@@ -96,16 +186,18 @@ func (t *H2Transport) Listen(a ma.Multiaddr) (transport.Listener, error) {
 	if len(ps) < 3 {
 		return nil, errors.New("Unexpected len of protocols")
 	}
-	lnet, lnaddr, err := manet.DialArgs(a)
+	_, lnaddr, err := manet.DialArgs(a)
 	if err != nil {
 		return nil, err
 	}
 
-	nl, err := net.Listen(lnet, lnaddr)
+	pmux, err := portMux(lnaddr)
+
 	if err != nil {
 		return nil, err
 	}
-	laddr, err := manet.FromNetAddr(nl.Addr())
+
+	laddr, err := manet.FromNetAddr(pmux.l.Addr())
 	if err != nil {
 		return nil, err
 	}
@@ -113,31 +205,74 @@ func (t *H2Transport) Listen(a ma.Multiaddr) (transport.Listener, error) {
 
 	malist := &listener {
 		t: t,
-		l: nl,
-		incoming: make(chan *Conn),
+		incoming: make(chan transport.CapableConn),
 		closed:   make(chan struct{}),
 	}
 
 	switch ps[2].Name {
 	case "ws": {
+		malist.l = pmux.ws
 		wsma, err := ma.NewMultiaddr("/ws")
 		if err != nil {
 			return nil, err
 		}
 		laddr = laddr.Encapsulate(wsma)
 		malist.laddr = laddr
-
+		go func() {
+			defer close(malist.closed)
+			_ = http.Serve(malist.l, malist)
+		}()
 
 	}
 	case "http": {
+		malist.l = pmux.h2
+		wsma, err := ma.NewMultiaddr("/http")
+		if err != nil {
+			return nil, err
+		}
+		laddr = laddr.Encapsulate(wsma)
+		malist.laddr = laddr
+		go func() {
+			conn, err := malist.l.Accept()
+			if err != nil {
+				return
+			}
+
+			h2Server := &http2.Server{}
+			go h2Server.ServeConn(
+				conn,
+				&http2.ServeConnOpts{
+					Handler: malist})
+		}()
+
 	}
 	case "https": {
+		malist.l = pmux.tls
+		wsma, err := ma.NewMultiaddr("/https")
+		if err != nil {
+			return nil, err
+		}
+		laddr = laddr.Encapsulate(wsma)
+		malist.laddr = laddr
+		go func() {
+			conn, err := malist.l.Accept()
+			if err != nil {
+				return
+			}
+
+			go func() {
+
+				h2Server := &http2.Server{}
+				h2Server.ServeConn(
+					conn, //&FakeTLSConn{conn},
+					&http2.ServeConnOpts{
+						Handler: malist})
+			}()
+		}()
 	}
 	default:
 		return nil, errors.New("Unexpected " + ps[2].Name)
 	}
-
-	go malist.serve()
 
 	return malist, nil
 }
@@ -151,7 +286,7 @@ func (t *H2Transport) NewCapableConn(ctx context.Context, unsec net.Conn, isServ
 	var mnc *tls.Conn
 	var err error
 	if isServer {
-		mnc, err = c.SecureInbound(ctx, unsec)
+		mnc, err = t.SecureInbound(ctx, c, unsec)
 		if err != nil {
 			return nil, err
 		}

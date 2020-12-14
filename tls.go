@@ -22,7 +22,7 @@ func init() {
 
 
 // SecureInbound runs the TLS handshake as a server.
-func (c *SPDYConn) SecureInbound(ctx context.Context, insecure net.Conn) (*tls.Conn, error) {
+func (t *H2Transport) SecureInbound(ctx context.Context, c *SPDYConn, insecure net.Conn) (*tls.Conn, error) {
 	config, keyCh := c.t.ConfigForAny()
 	cs, err := c.handshake(ctx, tls.Server(insecure, config), keyCh)
 	if err != nil {

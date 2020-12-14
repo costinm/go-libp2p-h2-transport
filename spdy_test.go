@@ -10,27 +10,48 @@ import (
 	"testing"
 
 	ic "github.com/libp2p/go-libp2p-core/crypto"
+	"github.com/libp2p/go-libp2p-core/mux"
 	"github.com/libp2p/go-libp2p-core/peer"
 	tpt "github.com/libp2p/go-libp2p-core/transport"
 	ma "github.com/multiformats/go-multiaddr"
 )
 
-const skey = "CAESQDXW7-QhEhXWdgDUg7AvhlJU2eN-2IzMoDOWl_P271npGnwf4KUMcqufSakCfFi373F8C2HqINHxWalQwk3pVrc="
 const addr = "/ip4/127.0.0.1/tcp/5555/https"
 const spub = "12D3KooWBbkYafqbHDtmCpp47aj8P16YVfUGtyBeBB1txENTYU7x"
 
+type env struct {
+	// used for WS. Also TCP MUX port.
+	httpPort uint32
+
+	// HTTP/2 plain text
+	http2Port uint32
+
+	// WSS and HTTPS
+	httpsPort uint32
+
+	key64 string
+}
+
+
+var (
+	srv = &env{
+		key64: "CAESQDXW7-QhEhXWdgDUg7AvhlJU2eN-2IzMoDOWl_P271npGnwf4KUMcqufSakCfFi373F8C2HqINHxWalQwk3pVrc=",
+	}
+	client = &env{}
+)
+
 func TestH2Transport(t *testing.T) {
-	err := runServer(5555)
+	err := srv.runServer(5555)
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = runClient(addr, spub)
+	err = client.runClient(addr, spub)
 	if err != nil {
 		t.Fatal(err)
 	}
 }
 
-func runClient(raddr string, p string) error {
+func (e *env) runClient(raddr string, p string) error {
 	peerID, err := peer.Decode(p)
 	if err != nil {
 		return err
@@ -57,7 +78,7 @@ func runClient(raddr string, p string) error {
 	defer conn.Close()
 
 	// Reverse connections from server
-	go handleConn(conn)
+	go handleConn(conn, false)
 
 	str, err := conn.OpenStream()
 	if err != nil {
@@ -81,8 +102,9 @@ func runClient(raddr string, p string) error {
 	return nil
 }
 
-func runServer(port uint32) error {
-	kb, _ := base64.URLEncoding.DecodeString(skey)
+// Run the transport servers.
+func (e *env) runServer(port uint32) error {
+	kb, _ := base64.URLEncoding.DecodeString(e.key64)
 	priv, _ := ic.UnmarshalPrivateKey(kb)
 	t, err := NewH2Transport(priv, nil, nil)
 	if err != nil {
@@ -122,6 +144,7 @@ func runServer(port uint32) error {
 	return nil
 }
 
+// Implement the listener side ( server ).
 func handleListener(ln tpt.Listener) {
 		for {
 			conn, err := ln.Accept()
@@ -130,7 +153,7 @@ func handleListener(ln tpt.Listener) {
 				return
 			}
 			go func() {
-				if err := handleConn(conn); err != nil {
+				if err := handleConn(conn, true); err != nil {
 					log.Printf("handling SPDYConn failed: %s", err.Error())
 				}
 				str, err := conn.OpenStream()
@@ -158,7 +181,8 @@ func handleListener(ln tpt.Listener) {
 
 }
 
-func handleConn(conn tpt.CapableConn) error {
+// Handle a connection, accepting streams
+func handleConn(conn tpt.CapableConn, isServer bool) error {
 	r, _ := conn.RemotePublicKey().Raw()
 
 	// Extra "ACQIARIg" in base64 for ED
@@ -176,6 +200,12 @@ func handleConn(conn tpt.CapableConn) error {
 	if err != nil {
 		return err
 	}
+
+	return handleStream(conn, str, isServer)
+}
+
+// Handle a stream.
+func handleStream(conn tpt.CapableConn, str mux.MuxedStream, isServer bool) error {
 	data, err := ioutil.ReadAll(str)
 	if err != nil {
 		return err

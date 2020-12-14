@@ -160,8 +160,9 @@ func (c *SPDYConn) RemoteMultiaddr() ma.Multiaddr {
 	if err != nil {
 		return nil
 	}
+	wsma, _ := ma.NewMultiaddr("/ws")
 	//r, _ := manet.FromNetAddr(c.wsCon.RemoteAddr())
-	udpMA = udpMA.Encapsulate(wsMA)
+	udpMA = udpMA.Encapsulate(wsma)
 	return udpMA
 }
 
